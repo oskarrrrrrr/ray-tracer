@@ -1,5 +1,7 @@
-build/
+release/
+debug/
 bin/
+out/
 
 .DS_store
 *.ppm

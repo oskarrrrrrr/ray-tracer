@@ -49,6 +49,10 @@ bool operator==(const Vec3& v, const Vec3& u) {
     return v.x == u.x && v.y == u.y && v.z == u.z;
 }
 
+bool operator!=(const Vec3& v, const Vec3& u) {
+    return v.x != u.x || v.y != u.y || v.z != u.z;
+}
+
 f64 vec3_dot(const Vec3& v, const Vec3& u) {
     return v.x * u.x + v.y * u.y + v.z * u.z;
 }
