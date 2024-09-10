@@ -11,6 +11,7 @@ add_executable(
     src/main.cpp
     src/vec3.cpp
     src/obj.cpp
+    src/cmd.cpp
 )
 
 target_compile_features(rt PUBLIC cxx_std_17)

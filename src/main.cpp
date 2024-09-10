@@ -6,9 +6,14 @@
 #include "vec3.h"
 #include "common.h"
 #include "obj.h"
+#include "cmd.h"
 
 struct RGB {
     i32 mem;
+
+    RGB(u8 red, u8 green, u8 blue) {
+        mem = red * (1 << 16) + green * (1 << 8) + blue;
+    }
 
     inline u8 get_red() { return (u8) (mem / (1 << 16)); }
     inline u8 get_green() { return (u8) (mem / (1 << 8)) ; }
@@ -22,12 +27,6 @@ struct RGB {
         fprintf(f, "RGB(%hhu, %hhu, %hhu)", get_red(), get_green(), get_blue());
     }
 };
-
-RGB new_RGB(u8 red, u8 green, u8 blue) {
-    return RGB{
-        .mem = red * (1 << 16) + green * (1 << 8) + blue
-    };
-}
 
 struct FrameBuffer {
     RGB* buffer;
@@ -121,24 +120,26 @@ Obj::Mesh* parse_obj(const char* file_name) {
 
 RGB get_rand_color(int i) {
     static RGB colors[] = {
-        new_RGB(255, 0, 0),
-        new_RGB(0, 255, 0),
-        new_RGB(0, 0, 255),
-        new_RGB(255, 255, 0),
-        new_RGB(0, 255, 255),
-        new_RGB(255, 0, 255),
-        new_RGB(125, 125, 125),
-        new_RGB(255, 255, 255)
+        RGB(125, 125, 125),
+        RGB(185, 185, 185),
+        // RGB(255, 0, 0),
+        // RGB(0, 255, 0),
+        // RGB(0, 0, 255),
+        // RGB(255, 255, 0),
+        // RGB(0, 255, 255),
+        // RGB(255, 0, 255),
+        // RGB(60, 60, 60),
+        // RGB(255, 255, 255)
     };
-    return colors[i%8];
+    return colors[i%2];
 }
 
-struct Task {
+struct Pixel {
     int row;
     int col;
 };
 
-void shuffle_tasks(Task* array, size_t n) {
+void shuffle_pixels(Pixel* array, size_t n) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
     int usec = tv.tv_usec;
@@ -148,7 +149,7 @@ void shuffle_tasks(Task* array, size_t n) {
         size_t i;
         for (i = n - 1; i > 0; i--) {
             size_t j = (unsigned int) (drand48()*(i+1));
-            Task t = array[j];
+            Pixel t = array[j];
             array[j] = array[i];
             array[i] = t;
         }
@@ -159,7 +160,7 @@ struct Counter {
     int val;
     pthread_mutex_t mutex;
 
-    Counter() {
+    Counter(int val = 0) : val(val) {
         mutex = PTHREAD_MUTEX_INITIALIZER;
     }
 
@@ -170,46 +171,56 @@ struct Counter {
     }
 };
 
-struct BatchArgs {
-    int width;
+struct Camera {
     int height;
+    int width;
     Point3 top_left_pixel;
-    Point3 camera_origin;
+    Point3 origin;
     Vec3 viewport_width_d;
     Vec3 viewport_height_d;
-    Triangle* triangles;
-    Vec3* normals;
-    Obj::Mesh* mesh;
-    FrameBuffer frame_buffer;
-    int tasks_count;
-    Task* tasks;
-    Counter* counter;
+
+    Camera(
+        int height,
+        int width,
+        const Vec3& origin,
+        const Vec3& focal_offset
+    ) : width(width), height(height), origin(origin) {
+        f64 aspect_ratio = ((f64)width) / height;
+
+        f64 viewport_width = 2.0;
+        Vec3 viewport_width_v = Vec3 { .x = viewport_width };
+        f64 viewport_height = viewport_width / aspect_ratio;
+        Vec3 viewport_height_v = Vec3 { .y = viewport_height };
+
+        top_left_pixel = (
+            origin - focal_offset + viewport_width_v/2 + viewport_height_v/2
+        );
+
+        viewport_width_d = Vec3 { .x = viewport_width / width };
+        viewport_height_d = Vec3 { .y = viewport_height / height };
+    }
+
+    inline int pixels() { return height * width; }
 };
 
-void* process_batch(void* arg) {
-    BatchArgs* args = (BatchArgs*) arg;
-    int width = args->width;
-    int height = args->height;
-    Point3 top_left_pixel = args->top_left_pixel;
-    Point3 camera_origin = args->camera_origin;
-    Vec3 viewport_width_d = args->viewport_width_d;
-    Vec3 viewport_height_d = args->viewport_height_d;
-    Triangle* triangles = args->triangles;
-    Vec3* normals = args->normals;
-    Obj::Mesh* mesh = args->mesh;
-    FrameBuffer frame_buffer = args->frame_buffer;
-    int tasks_count = args->tasks_count;
-    Task* tasks = args->tasks;
-    Counter* counter = args->counter;
-
+void _process_batch(
+    const Camera& camera,
+    const Triangle* triangles,
+    const Vec3* normals,
+    const Obj::Mesh& mesh,
+    FrameBuffer frame_buffer,
+    int tasks_count,
+    Pixel* tasks,
+    Counter* counter
+){
     for (int i = 0; i < tasks_count; i++) {
         int row = tasks[i].row;
         int col = tasks[i].col;
-        Point3 curr = top_left_pixel - 0.5 * viewport_width_d - row * viewport_height_d - col * viewport_width_d;
+        Point3 curr = camera.top_left_pixel - 0.5 * camera.viewport_width_d - row * camera.viewport_height_d - col * camera.viewport_width_d;
         f64 min_t = F64_INF;
         int min_i = -1;
-        for (int i = 0; i < mesh->faces_count; i++) {
-            Ray ray = { .origin = camera_origin, .direction = curr - camera_origin };
+        for (int i = 0; i < mesh.faces_count; i++) {
+            Ray ray = { .origin = camera.origin, .direction = curr - camera.origin };
             f64 new_t = hit_triangle(triangles[i], normals[i], ray);
             if (new_t > 0 && new_t < min_t) {
                 min_t = new_t;
@@ -219,16 +230,42 @@ void* process_batch(void* arg) {
         if (min_t != F64_INF) {
             frame_buffer.set(row, col, get_rand_color(min_i));
         }
-        if (i % 1000 == 0) {
+        if (i > 0 && i % 1000 == 0) {
             counter->inc(1000);
         }
     }
+    counter->inc(tasks_count % 1000);
+}
+
+struct BatchArgs {
+    Camera* camera;
+    Triangle* triangles;
+    Vec3* normals;
+    Obj::Mesh* mesh;
+    FrameBuffer frame_buffer;
+    int pixels_count;
+    Pixel* pixels;
+    Counter* counter;
+};
+
+void* process_batch(void* arg) {
+    BatchArgs* args = (BatchArgs*) arg;
+    _process_batch(
+        *args->camera,
+        args->triangles,
+        args->normals,
+        *args->mesh,
+        args->frame_buffer,
+        args->pixels_count,
+        args->pixels,
+        args->counter
+    );
     return NULL;
 }
 
 struct StatusPrinterArgs {
     Counter* counter;
-    int tasks_count;
+    int pixels_count;
     bool* done;
 };
 
@@ -238,8 +275,8 @@ void _print_status(StatusPrinterArgs* args) {
         stderr,
         "\r%dk/%dk (%d%%)                    ",
         val/1000,
-        args->tasks_count/1000,
-        (int)((f64) val * 100 / args->tasks_count)
+        args->pixels_count/1000,
+        (int)((f64) val * 100 / args->pixels_count)
     );
 }
 
@@ -254,21 +291,20 @@ void* status_printer(void* args) {
     return NULL;
 }
 
-int main() {
-    // const char* in_file_name = "assets/teddy_bear.obj";
-    // Vec3 focal_offset = Vec3 { .z = 1 };
-    // Vec3 camera_origin = Vec3{ .z = 40 } + focal_offset;
 
-    // const char* in_file_name = "assets/cube.obj";
-    // Vec3 focal_offset = Vec3 { .z = -1 };
-    // Vec3 camera_origin = Vec3{ .x = -1, .y = -1, .z = -3 } + focal_offset;
+int main(int argc, char** argv) {
+    CmdArgs cmd_args;
+    if (!parse_cmd_args(argc, argv, cmd_args)) {
+        return 0;
+    }
 
-    const char* in_file_name = "assets/teapot.obj";
-    Vec3 focal_offset = Vec3 { .x = 0, .z = -1 };
-    Vec3 camera_origin = Vec3{ .x = 0, .y = 1.5, .z = -4 } + focal_offset;
+    auto camera = Camera(cmd_args.height, cmd_args.width, cmd_args.camera_origin, cmd_args.focal_offset);
 
-    fprintf(stderr, "Parsing obj file: \"%s\"\n", in_file_name);
-    Obj::Mesh* mesh = parse_obj(in_file_name);
+    RGB* buffer = (RGB*) calloc(camera.pixels(), sizeof(RGB));
+    FrameBuffer frame_buffer = { .buffer = buffer, .width = camera.width, .height = camera.height };
+
+    fprintf(stderr, "Parsing obj file: \"%s\"\n", cmd_args.in_file_name);
+    Obj::Mesh* mesh = parse_obj(cmd_args.in_file_name);
     fprintf(stderr, "Triangle Count: %d\n", mesh->faces_count);
 
     Triangle* triangles = (Triangle*) malloc(sizeof(Triangle) * mesh->faces_count);
@@ -285,87 +321,63 @@ int main() {
         normals[i] = triangle_normal(triangles[i]);
     }
 
-    int height = 800;
-    int width = 1200;
-    RGB* buffer = (RGB*) calloc(width * height, sizeof(RGB));
-    FrameBuffer frame_buffer = { .buffer = buffer, .width = width, .height = height };
-
-    f64 aspect_ratio = ((f64)width) / height;
-
-    f64 viewport_width = 2.0;
-    Vec3 viewport_width_v = Vec3 { .x = viewport_width };
-    f64 viewport_height = viewport_width / aspect_ratio;
-    Vec3 viewport_height_v = Vec3 { .y = viewport_height };
-
-    Vec3 top_left_pixel = (
-        camera_origin - focal_offset + viewport_width_v/2 + viewport_height_v/2
-    );
-
-    Vec3 viewport_width_d = Vec3 { .x = viewport_width / width };
-    Vec3 viewport_height_d = Vec3 { .y = viewport_height / height };
-
-    int tasks_count = width * height;
-    Task* tasks = (Task*) malloc(sizeof(Task) * tasks_count);
+    Pixel* pixels = (Pixel*) malloc(sizeof(Pixel) * camera.pixels());
     int i = 0;
-    for (int row = 0; row < height; row++) {
-        for (int col = 0; col < width; col++) {
-            tasks[i++] = Task { .row = row, .col = col };
+    for (int row = 0; row < camera.height; row++) {
+        for (int col = 0; col < camera.width; col++) {
+            pixels[i++] = Pixel { .row = row, .col = col };
         }
     }
-    shuffle_tasks(tasks, tasks_count);
+    shuffle_pixels(pixels, camera.pixels());
 
-    const int THREADS = 6;
-    pthread_t threads[THREADS];
-    BatchArgs args[THREADS];
+    pthread_t* threads = (pthread_t*) malloc(sizeof(pthread_t) * cmd_args.threads);
+    BatchArgs* args = (BatchArgs*) malloc(sizeof(BatchArgs) * cmd_args.threads);
 
     Counter progress_counter = Counter();
 
-    Task* tasks_ptr = tasks;
-    for (int i = 0; i < THREADS; i++) {
-        int tasks_count = width * height / THREADS;
+    Pixel* pixel_ptr = pixels;
+    for (int i = 0; i < cmd_args.threads; i++) {
+        int pixels_count = camera.pixels() / cmd_args.threads; // TODO: fix if not divisible?
+        if (i + 1 == cmd_args.threads) {
+            pixels_count = camera.pixels() - (cmd_args.threads - 1) * (camera.pixels() / cmd_args.threads);
+        }
         args[i] = {
-            .width = width,
-            .height = height,
-            .top_left_pixel = top_left_pixel,
-            .camera_origin = camera_origin,
-            .viewport_width_d = viewport_width_d,
-            .viewport_height_d = viewport_height_d,
+            .camera = &camera,
             .triangles = triangles,
             .normals = normals,
             .mesh = mesh,
             .frame_buffer = frame_buffer,
-            .tasks_count = tasks_count, // TODO: fix if not divisible?
-            .tasks = tasks_ptr,
+            .pixels_count = pixels_count,
+            .pixels = pixel_ptr,
             .counter = &progress_counter
         };
         pthread_create(&threads[i], NULL, process_batch, (void*)(&args[i]));
-        tasks_ptr += tasks_count;
+        pixel_ptr += pixels_count;
     }
 
     bool done = false;
     auto status_printer_args = StatusPrinterArgs {
         .counter = &progress_counter,
-        .tasks_count = tasks_count,
+        .pixels_count = camera.pixels(),
         .done = &done
     };
 
     pthread_t status_printer_thread;
     pthread_create(&status_printer_thread, NULL, status_printer, (void*)(&status_printer_args));
 
-    for (int i = 0; i < THREADS; i++) {
+    for (int i = 0; i < cmd_args.threads; i++) {
         pthread_join(threads[i], NULL);
     }
 
     done = true;
     pthread_join(status_printer_thread, NULL);
 
-    const char* file_name = "img.ppm";
-    FILE* f = fopen(file_name, "w");
+    FILE* f = fopen(cmd_args.out_file_name, "w");
     if (f == NULL) {
-        fprintf(stderr, "Failed to open: \"%s\"\n", file_name);
+        fprintf(stderr, "Failed to open: \"%s\"\n", cmd_args.out_file_name);
         exit(1);
     }
-    fprintf(stderr, "Saving result to: \"%s\"\n", file_name);
+    fprintf(stderr, "Saving result to: \"%s\"\n", cmd_args.out_file_name);
     frame_buffer.to_ppm(f);
     fclose(f);
 }
